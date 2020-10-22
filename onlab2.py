@@ -8,51 +8,69 @@ from transformers import AutoModel, AutoTokenizer, AdamW
 
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 
-df_test = pd.read_csv("test2.csv", sep='\t')
-df_train = pd.read_csv("train2.csv", sep='\t')
-df_val=pd.read_csv("val2.csv", sep='\t')
+torch.cuda.set_device(1)
+
+device = torch.device("cuda")
+torch.cuda.current_device()
+
+df_test = pd.read_csv("test.tsv", sep='\t', header=None, na_filter=None, quoting=3)
+df_train = pd.read_csv("train.tsv", sep='\t', header=None, na_filter=None, quoting=3)
+df_val=pd.read_csv("dev.tsv", sep='\t', header=None,na_filter=None, quoting=3)
 
 df_train.head()
 
-from ipywidgets import IntProgress
-
-bert = AutoModel.from_pretrained('bert-base-uncased')
+bert = AutoModel.from_pretrained('bert-base-uncased', output_hidden_states = True)
 tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
 
-train_text = df_train['text']
-train_labels= df_train['grammar']
-train_number = df_train['number']
+train_text = df_train[0][:5]
+train_labels= df_train[3][:5]
+train_number = df_train[2][:5]
 #train_text max len
-val_text = df_val['text']
-val_labels=df_val['grammar']
+val_text = df_val[0]
+val_labels=df_val[3]
+
+train_label_list = list(set(train_labels))
+train_label_list
 
 def mapLabels(x):
     return {
-        'Nom': 0,
-        'Acc': 1,
-        'Sub': 2,
-        'Ine': 3,
-        'Sup': 4,
-        'Ins': 5
+        'Plur': 0,
+        'Sing': 1,
     }.get(x, 9) 
 
 train_label_list = list(set(train_labels))
-
 train_numbered_labels = []
 for label in train_labels:
     train_numbered_labels.append(mapLabels(label))
     
-val_label_list = list(set(val_labels))	
+	
+val_label_list = list(set(val_labels))
 val_numbered_labels = []
 for label in val_labels:
     val_numbered_labels.append(mapLabels(label))
 
-tokens_train = tokenizer(train_text.values.tolist(), max_length=512, padding=True, truncation=True, return_tensors="pt")
+training_tokens = []
+piece_tokens = []
+token = ""
+for sent in train_text.values:
+    sent=sent.split()
+    for wordpiece in sent:
+        print(wordpiece)
+        token = tokenizer(wordpiece, max_length=70,
+                          padding=True, truncation=True, return_tensors="pt")
+        print(token)
+        piece_tokens.append(token)
+    training_tokens.append(piece_tokens)
+    piece_tokens = []
+	
+
+#tokens_train = tokenizer(train_text.values.tolist(), max_length=512,
+ #                        padding=True, truncation=True, return_tensors="pt")
 
 
-tokens_val = tokens_train = tokenizer(val_text.values.tolist(), max_length=512, padding=True, truncation=True, return_tensors="pt")
-
-
+#tokens_val = tokenizer(val_text.values.tolist(), max_length=512,
+ #                                     padding=True, truncation=True, return_tensors="pt")
+	
 train_seq = torch.as_tensor(tokens_train['input_ids'])
 train_mask = torch.as_tensor(tokens_train['attention_mask'])
 train_y = torch.tensor(train_numbered_labels)
@@ -67,13 +85,14 @@ train_data = TensorDataset(train_seq, train_mask, train_y)
 
 train_= RandomSampler(train_data)
 
-train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=batch_size)
+train_dataloader = DataLoader(train_data,  batch_size=batch_size)
 
 val_data = TensorDataset(val_seq, val_mask, val_y)
 
 val_sampler = SequentialSampler(val_data)
 
-val_dataloader = DataLoader(val_data, sampler = val_sampler, batch_size=batch_size)
+val_dataloader = DataLoader(val_data, batch_size=batch_size)
+
 
 class myBert(nn.Module):
 
@@ -82,7 +101,7 @@ class myBert(nn.Module):
         super(myBert, self).__init__()
 
         self.bert = bert
-        self.dropuot=nn.Dropout(0.1)
+        self.dropout=nn.Dropout(0.1)
         self.relu=nn.ReLU()
         self.fc1 = nn.Linear(768,2)
         self.softmax = nn.LogSoftmax(dim=1)
@@ -94,13 +113,19 @@ class myBert(nn.Module):
         x=self.dropout(x)
         x=self.softmax(x)
         return x
-
+        
 model = myBert(bert)
+model = model.to(device)
 
 optimizer = AdamW(model.parameters(),
                   lr = 1e-5) 
 
 cross_entropy = nn.NLLLoss()
+
+def flat_accuracy(preds, labels):
+    pred_flat = np.argmax(preds, axis=1).flatten()
+    labels_flat = labels.flatten()
+    return np.sum(pred_flat == labels_flat) / len(labels_flat)
 
 def train():
   
@@ -123,10 +148,17 @@ def train():
     model.zero_grad()        
 
     preds = model(sent_id, mask)
+    
 
     loss = cross_entropy(preds, labels)
 
     total_loss = total_loss + loss.item()
+    
+    preds=preds.detach().cpu().numpy()
+    
+    label_ids = labels.to('cpu').numpy()
+    
+    total_accuracy += flat_accuracy(preds, label_ids)
 
     loss.backward()
 
@@ -134,17 +166,18 @@ def train():
 
     optimizer.step()
 
-    preds=preds.detach().cpu().numpy()
+    
 
     total_preds.append(preds)
-
+    
+    
   avg_loss = total_loss / len(train_dataloader)
-  
+  avg_accuracy = total_accuracy / len(train_dataloader)
   # predictions are in the form of (no. of batches, size of batch, no. of classes).
   # reshape the predictions in form of (number of samples, no. of classes)
   total_preds  = np.concatenate(total_preds, axis=0)
 
-  return avg_loss, total_preds
+  return avg_loss, avg_accuracy, total_preds
 
 
 def eval():
@@ -157,45 +190,60 @@ def eval():
     for step,batch in enumerate(val_dataloader):
          # progress update after every 5 batches.
         if step % 5 == 0 and not step == 0:
-            elapsed = format_time(time.time() - t0)
             print('  Batch {:>5,}  of  {:>5,}.'.format(step, len(val_dataloader)))
+        
+        batch = [t.to(device) for t in batch]
+
+        
         sent_id, mask, labels = batch
 
         with torch.no_grad():
+            
             preds = model(sent_id, mask)
+            
             loss = cross_entropy(preds,labels)
+            
             total_loss = total_loss + loss.item()
+            
+            preds = preds.detach().cpu().numpy()
+            label_ids = labels.to('cpu').numpy()
+            
+            total_accuracy += flat_accuracy(preds, label_ids)
+            
+            
+            
             total_preds.append(preds)
 
+    avg_accuracy = total_accuracy / len(val_dataloader)
+    avg_loss = total_loss/len(val_dataloader)
+    total_preds  = np.concatenate(total_preds, axis=0)
 
-        avg_loss = total_loss/len(val_dataloader)
-        total_preds  = np.concatenate(total_preds, axis=0)
+    return avg_loss, avg_accuracy, total_preds
 
-    return val_loss, total_preds
 
-# empty lists to store training and validation loss of each epoch
 train_losses=[]
 valid_losses=[]
 
 epochs = 10
 
-#for each epoch
+
 for epoch in range(epochs):
      
     print('\n Epoch {:} / {:}'.format(epoch + 1, epochs))
     
     #train model
-    train_loss, _ = train()
+    train_loss, train_acc, _ = train()
     
     #evaluate model
-    valid_loss, _ = evaluate()
+    valid_loss, valid_acc, _ = eval()
     
     train_losses.append(train_loss)
     valid_losses.append(valid_loss)
     
-    print(f'\nTraining Loss: {train_loss:.3f}')
+    print(f'\nTraining Acc: {train_acc:.3f}')
+    print(f'Training Loss: {train_loss:.3f}')
+    print(f'\nValidation Acc: {valid_acc:.3f}')
     print(f'Validation Loss: {valid_loss:.3f}')
-	
 	
 with torch.no_grad():
   preds = model(test_seq.to(device), test_mask.to(device))
